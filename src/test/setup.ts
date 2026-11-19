@@ -38,3 +38,35 @@ global.ResizeObserver = vi.fn().mockImplementation((_callback) => ({
   unobserve: vi.fn(),
   disconnect: vi.fn(),
 }));
+
+// Node ≥22 exposes an experimental `localStorage` global that is undefined
+// unless the process is launched with --localstorage-file, and it shadows
+// jsdom's working implementation in module scopes (e.g. @nostrify/react's
+// NostrLoginProvider, useLocalStorage). Force a working storage in tests.
+const memoryStore = new Map<string, string>();
+const localStorageStub = {
+  getItem: (key: string) => memoryStore.get(key) ?? null,
+  setItem: (key: string, value: string) => {
+    memoryStore.set(key, String(value));
+  },
+  removeItem: (key: string) => {
+    memoryStore.delete(key);
+  },
+  clear: () => {
+    memoryStore.clear();
+  },
+  key: (index: number) => Array.from(memoryStore.keys())[index] ?? null,
+  get length() {
+    return memoryStore.size;
+  },
+};
+Object.defineProperty(globalThis, 'localStorage', {
+  configurable: true,
+  writable: true,
+  value: localStorageStub,
+});
+Object.defineProperty(window, 'localStorage', {
+  configurable: true,
+  writable: true,
+  value: localStorageStub,
+});
