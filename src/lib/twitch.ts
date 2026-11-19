@@ -1,12 +1,13 @@
-// Twitch OAuth configuration
-export const TWITCH_CLIENT_ID = 'whoyrkl3vhkfuaubb9iui9h84e2ys5';
+// Twitch chat integration for the unified livestream chat.
+//
+// The broadcaster token lives server-side in a Cloudflare Worker
+// (see worker/ and .github/workflows/twitch-secrets.yml). The browser never
+// sees a Twitch token; it talks to the same-origin proxy under /twitch/* for
+// Helix calls and connects to EventSub's public WebSocket directly.
+
 export const TWITCH_CHANNEL = 'peachyhodl';
 
-// Dynamic redirect URI based on environment
-const isDevelopment = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-export const TWITCH_REDIRECT_URI = isDevelopment 
-  ? `${window.location.protocol}//${window.location.host}/stream/chat`
-  : 'https://peachyhodl.com/stream/chat';
+const PROXY_BASE = '/twitch';
 
 export interface TwitchMessage {
   id: string;
@@ -43,73 +44,22 @@ export interface TwitchMessage {
   zapType?: 'profile' | 'stream';
 }
 
-export function getTwitchAuthUrl(): string {
-  const params = new URLSearchParams({
-    client_id: TWITCH_CLIENT_ID,
-    redirect_uri: TWITCH_REDIRECT_URI,
-    response_type: 'token',
-    scope: 'chat:read chat:edit user:read:chat moderator:read:followers bits:read channel:read:subscriptions'
-  });
-  
-  return `https://id.twitch.tv/oauth2/authorize?${params.toString()}`;
-}
+// ─── server-proxy calls (token stays server-side) ───────────────────────────
 
-export function parseTwitchToken(): string | null {
-  // Check URL hash for token (Twitch uses implicit flow)
-  const hash = window.location.hash.substring(1);
-  const params = new URLSearchParams(hash);
-  const token = params.get('access_token');
-  
-  if (token) {
-    // Store token in localStorage
-    localStorage.setItem('twitch_token', token);
-    // Clean up URL
-    window.history.replaceState(null, '', window.location.pathname);
-    return token;
-  }
-  
-  // Check localStorage for existing token
-  return localStorage.getItem('twitch_token');
-}
-
-export function clearTwitchToken(): void {
-  localStorage.removeItem('twitch_token');
-}
-
-// EventSub WebSocket session management
-export function storeTwitchSession(sessionId: string): void {
-  localStorage.setItem('twitch_eventsub_session', sessionId);
-}
-
-export function getTwitchSession(): string | null {
-  return localStorage.getItem('twitch_eventsub_session');
-}
-
-export function clearTwitchSession(): void {
-  localStorage.removeItem('twitch_eventsub_session');
-}
-
-// Get broadcaster user ID (needed for EventSub subscriptions)
-export async function getBroadcasterUserId(accessToken: string): Promise<string | null> {
-  try {
-    const response = await fetch('https://api.twitch.tv/helix/users?login=' + TWITCH_CHANNEL, {
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Client-Id': TWITCH_CLIENT_ID
-      }
-    });
-    
-    if (!response.ok) {
-      console.error('Failed to fetch broadcaster user ID:', response.status);
-      return null;
+/** Broadcaster user id via the /twitch proxy. Throws with admin-facing hints. */
+export async function getBroadcasterUserId(login = TWITCH_CHANNEL): Promise<string> {
+  const res = await fetch(`${PROXY_BASE}/broadcaster?login=${encodeURIComponent(login)}`);
+  const data = await res.json().catch(() => ({})) as { id?: string; error?: string; status?: number; hint?: string };
+  if (!res.ok || !data.id) {
+    if (res.status === 503 || data.error === 'not-configured') {
+      throw new Error('Twitch relay not configured yet (admin: set the GitHub secrets and run the "Twitch Secrets → Worker" workflow)');
     }
-    
-    const data = await response.json();
-    return data.data?.[0]?.id || null;
-  } catch (error) {
-    console.error('Error fetching broadcaster user ID:', error);
-    return null;
+    if (res.status === 401) {
+      throw new Error('Twitch token rejected (admin: refresh the TWITCH_REFRESH_TOKEN or TWITCH_ACCESS_TOKEN GitHub secret, then re-run the workflow)');
+    }
+    throw new Error(data.hint || data.error || `Twitch relay error (${res.status})`);
   }
+  return data.id;
 }
 
 // EventSub subscription types
@@ -117,59 +67,39 @@ export interface EventSubSubscription {
   type: string;
   version: string;
   condition: Record<string, string>;
-  transport: {
-    method: 'websocket';
-    session_id: string;
-  };
+  /** Browser EventSub WebSocket session id (from session_welcome). */
+  session_id: string;
 }
 
-// Create EventSub subscription
-export async function createEventSubSubscription(
-  accessToken: string,
-  subscription: EventSubSubscription
-): Promise<boolean> {
+/** Create an EventSub subscription via the proxy; the proxy attaches the token. */
+export async function createEventSubSubscription(subscription: EventSubSubscription): Promise<boolean> {
   try {
-    const response = await fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
+    const res = await fetch(`${PROXY_BASE}/eventsub/subscriptions`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Client-Id': TWITCH_CLIENT_ID,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(subscription)
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: subscription.type,
+        version: subscription.version,
+        condition: subscription.condition,
+        session_id: subscription.session_id,
+      }),
     });
-    
-    if (!response.ok) {
-      const error = await response.json();
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({})) as { error?: string; detail?: { message?: string } };
       console.error('Failed to create EventSub subscription:', {
-        status: response.status,
-        statusText: response.statusText,
+        status: res.status,
         error,
-        subscription
+        subscription: { type: subscription.type, version: subscription.version },
       });
-      
-      // Log specific error details to help debugging
-      if (error.message) {
-        console.error('Twitch API Error:', error.message);
+      if (error.detail?.message) {
+        console.error('Twitch API Error:', error.detail.message);
       }
-      if (error.error) {
-        console.error('Twitch Error Type:', error.error);
-      }
-      
       return false;
     }
-    
-    const result = await response.json();
-    console.log('EventSub subscription created successfully:', result);
-    
-    // Check subscription limits
-    if (result.total_cost && result.max_total_cost) {
-      console.log(`Subscription cost: ${result.total_cost}/${result.max_total_cost}`);
-      if (result.total_cost >= result.max_total_cost * 0.8) {
-        console.warn('⚠️ Approaching subscription cost limit!');
-      }
+    const result = await res.json() as { total_cost?: number; max_total_cost?: number };
+    if (result.total_cost && result.max_total_cost && result.total_cost >= result.max_total_cost * 0.8) {
+      console.warn('⚠️ Approaching EventSub subscription cost limit!');
     }
-    
     return true;
   } catch (error) {
     console.error('Error creating EventSub subscription:', error);
@@ -177,7 +107,8 @@ export async function createEventSubSubscription(
   }
 }
 
-// EventSub message types
+// ─── EventSub WebSocket message types ───────────────────────────────────────
+
 export interface EventSubMessage {
   metadata: {
     message_id: string;
@@ -340,122 +271,4 @@ export function convertEventSubToTwitchMessage(message: EventSubMessage): Twitch
       console.log('Unknown EventSub subscription type:', subscription_type);
       return null;
   }
-}
-
-// Parse IRC message tags
-export function parseIRCTags(tags: string): Record<string, string> {
-  const parsed: Record<string, string> = {};
-  if (!tags) return parsed;
-  
-  const pairs = tags.split(';');
-  for (const pair of pairs) {
-    const [key, value] = pair.split('=');
-    if (key && value !== undefined) {
-      parsed[key] = value;
-    }
-  }
-  
-  return parsed;
-}
-
-// Parse Twitch IRC message including special events
-export function parseTwitchIRCMessage(message: string): TwitchMessage | null {
-  const parts = message.match(/^(?:@([^ ]+) )?(?::([^ ]+) )?([^ ]+)(?: (.*))?$/);
-  if (!parts) return null;
-  
-  const [, tags, source, command, params] = parts;
-  
-  // Handle both PRIVMSG and USERNOTICE (for special events)
-  if (command !== 'PRIVMSG' && command !== 'USERNOTICE') return null;
-  
-  const tagsParsed = parseIRCTags(tags || '');
-  const channelAndMessage = params?.match(/^#\w+ :(.*)$/);
-  const messageText = channelAndMessage?.[1] || '';
-  const username = source?.match(/^([^!]+)/)?.[1] || 'Unknown';
-  
-  // Determine message type from tags
-  const msgId = tagsParsed['msg-id'];
-  
-  // Base message object
-  const baseMessage: TwitchMessage = {
-    id: tagsParsed['id'] || Math.random().toString(36),
-    username,
-    displayName: tagsParsed['display-name'] || username,
-    message: messageText,
-    timestamp: parseInt(tagsParsed['tmi-sent-ts'] || Date.now().toString()),
-    color: tagsParsed['color'],
-    badges: tagsParsed['badges']?.split(',') || [],
-    isMod: tagsParsed['mod'] === '1',
-    isSubscriber: tagsParsed['subscriber'] === '1',
-    isVip: tagsParsed['vip'] === '1',
-    isBroadcaster: tagsParsed['badges']?.includes('broadcaster') || false,
-    messageType: 'chat'
-  };
-  
-  // Handle special message types
-  if (msgId) {
-    switch (msgId) {
-      case 'sub':
-      case 'resub':
-        return {
-          ...baseMessage,
-          messageType: 'subscription',
-          isResub: msgId === 'resub',
-          subTier: tagsParsed['msg-param-sub-plan'] as TwitchMessage['subTier'],
-          subMonths: parseInt(tagsParsed['msg-param-cumulative-months'] || '1'),
-          subMessage: messageText || tagsParsed['system-msg']?.replace(/\\s/g, ' ')
-        };
-        
-      case 'subgift':
-      case 'submysterygift':
-        return {
-          ...baseMessage,
-          messageType: 'giftsub',
-          subTier: tagsParsed['msg-param-sub-plan'] as TwitchMessage['subTier'],
-          giftRecipient: tagsParsed['msg-param-recipient-display-name'] || tagsParsed['msg-param-recipient-user-name'],
-          giftMonths: parseInt(tagsParsed['msg-param-gift-months'] || '1'),
-          giftTotal: parseInt(tagsParsed['msg-param-sender-count'] || '0'),
-          message: tagsParsed['system-msg']?.replace(/\\s/g, ' ') || 
-                  `${baseMessage.displayName} gifted a sub to ${tagsParsed['msg-param-recipient-display-name']}!`
-        };
-        
-      case 'raid':
-        return {
-          ...baseMessage,
-          messageType: 'raid',
-          raidViewers: parseInt(tagsParsed['msg-param-viewerCount'] || '0'),
-          raidFromChannel: tagsParsed['msg-param-displayName'],
-          message: `${tagsParsed['msg-param-displayName']} is raiding with ${tagsParsed['msg-param-viewerCount']} viewers!`
-        };
-        
-      case 'announcement':
-        return {
-          ...baseMessage,
-          messageType: 'announcement',
-          message: messageText
-        };
-        
-      case 'follow':
-        return {
-          ...baseMessage,
-          messageType: 'follow',
-          isFirstTimeFollower: true,
-          message: tagsParsed['system-msg']?.replace(/\\s/g, ' ') || 
-                  `${baseMessage.displayName} is now following!`
-        };
-    }
-  }
-  
-  // Check for bits in regular messages
-  if (tagsParsed['bits']) {
-    return {
-      ...baseMessage,
-      messageType: 'bits',
-      bits: parseInt(tagsParsed['bits']),
-      message: messageText
-    };
-  }
-  
-  // Regular chat message
-  return baseMessage;
 }

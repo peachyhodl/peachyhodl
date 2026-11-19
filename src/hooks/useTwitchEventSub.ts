@@ -1,32 +1,24 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { 
-  TwitchMessage, 
-  parseTwitchToken, 
-  clearTwitchToken,
+import {
+  TwitchMessage,
   getBroadcasterUserId,
   createEventSubSubscription,
   parseEventSubMessage,
   convertEventSubToTwitchMessage,
-  storeTwitchSession,
-  clearTwitchSession,
-  TWITCH_CLIENT_ID,
   type EventSubSubscription
 } from '@/lib/twitch';
 
 interface UseTwitchEventSubReturn {
   messages: TwitchMessage[];
   isConnected: boolean;
-  isAuthenticated: boolean;
   error: string | null;
   connect: () => void;
   disconnect: () => void;
-  clearAuth: () => void;
 }
 
 export function useTwitchEventSub(): UseTwitchEventSubReturn {
   const [messages, setMessages] = useState<TwitchMessage[]>([]);
   const [isConnected, setIsConnected] = useState(false);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const oldWsRef = useRef<WebSocket | null>(null); // For reconnect flow
@@ -34,19 +26,11 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
   const sessionIdRef = useRef<string | null>(null);
   const isReconnectingRef = useRef(false);
   const manualDisconnectRef = useRef(false);
+  const autoConnectTriedRef = useRef(false);
 
   const connect = useCallback(async (reconnectUrl?: string) => {
-    const token = parseTwitchToken();
-    
-    if (!token) {
-      setIsAuthenticated(false);
-      setError('Not authenticated with Twitch');
-      return;
-    }
-
-    setIsAuthenticated(true);
     manualDisconnectRef.current = false;
-    
+
     // Don't close existing connection if this is a reconnect
     if (!reconnectUrl && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       console.log('Already connected, skipping new connection');
@@ -90,9 +74,7 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
             const keepaliveTimeout = eventSubMessage.payload.session.keepalive_timeout_seconds || 10;
             
             sessionIdRef.current = sessionId;
-            storeTwitchSession(sessionId);
             setIsConnected(true);
-            setError(null);
             
             // If this was a reconnect, close the old connection now
             if (isReconnectingRef.current && oldWsRef.current) {
@@ -121,7 +103,7 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
             // (reconnect maintains existing subscriptions)
             if (!reconnectUrl) {
               // We have 10 seconds to create subscriptions
-              await createEventSubSubscriptions(token, sessionId);
+              await createEventSubSubscriptions(sessionId);
             }
             break;
           }
@@ -160,7 +142,6 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
             }
             
             const twitchMessage = convertEventSubToTwitchMessage(eventSubMessage);
-            console.log('Converted to TwitchMessage:', twitchMessage);
             if (twitchMessage) {
               setMessages(prev => {
                 const updated = [...prev, twitchMessage];
@@ -281,15 +262,12 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
           setError(errorMessage);
         }
 
-        // Reconnect if needed and we have a token
+        // Reconnect if needed
         if (shouldReconnect && !manualDisconnectRef.current) {
-          const token = parseTwitchToken();
-          if (token) {
-            console.log('Reconnecting in 1 second...');
-            setTimeout(() => {
-              connect();
-            }, 1000);
-          }
+          console.log('Reconnecting in 1 second...');
+          setTimeout(() => {
+            connect();
+          }, 1000);
         }
       };
 
@@ -297,47 +275,26 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
       console.error('Failed to connect to EventSub:', error);
       setError('Failed to connect to EventSub');
     }
-  }, []); // Remove isAuthenticated dependency to keep connect stable
+  }, []);
 
-  const createEventSubSubscriptions = async (accessToken: string, sessionId: string) => {
-    const broadcasterId = await getBroadcasterUserId(accessToken);
-    if (!broadcasterId) {
-      setError('Failed to get broadcaster user ID');
+  const createEventSubSubscriptions = async (sessionId: string) => {
+    // Broadcaster id + token both live server-side (see worker/).
+    // Any failure here is an admin-actionable configuration problem.
+    let broadcasterId: string;
+    try {
+      broadcasterId = await getBroadcasterUserId();
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to get broadcaster user ID');
       return;
     }
 
     console.log('Creating subscriptions for broadcaster ID:', broadcasterId);
 
-    // Get the authenticated user's info to see who is actually authenticated
-    let authenticatedUser: { id?: string; login?: string; display_name?: string } | null = null;
-    try {
-      const userResponse = await fetch('https://api.twitch.tv/helix/users', {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Client-Id': TWITCH_CLIENT_ID
-        }
-      });
-      
-      if (userResponse.ok) {
-        const userData = await userResponse.json() as { data?: Array<{ id: string; login: string; display_name: string }> };
-        authenticatedUser = userData.data?.[0] || null;
-        console.log('Authenticated as:', {
-          id: authenticatedUser?.id,
-          login: authenticatedUser?.login,
-          display_name: authenticatedUser?.display_name
-        });
-        console.log('Target broadcaster (peachyhodl) ID:', broadcasterId);
-        
-        if (authenticatedUser?.login?.toLowerCase() !== 'peachyhodl') {
-          console.warn('⚠️  You are not authenticated as peachyhodl! Most EventSub subscriptions will fail.');
-          setError(`⚠️ Authentication Issue: You're logged in as "${authenticatedUser?.login || 'unknown'}" but need to be logged in as "peachyhodl" (the broadcaster) for most Twitch events to work. Only raids and your own chat messages will be received. Please log out and log in as peachyhodl to receive follows, bits, subscriptions, and all chat messages.`);
-        }
-      }
-    } catch (error) {
-      console.warn('Could not get authenticated user info:', error);
-    }
-
-    const subscriptions: Omit<EventSubSubscription, 'transport'>[] = [
+    // The server-side token belongs to the broadcaster (peachyhodl), so
+    // user_id = broadcasterId on channel.chat.message receives ALL chat
+    // messages in the channel.
+    const subscriptions: Omit<EventSubSubscription, 'transport' | 'session_id'>[] = [
       // Follow events
       {
         type: 'channel.follow',
@@ -387,13 +344,13 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
           to_broadcaster_user_id: broadcasterId
         }
       },
-      // Chat messages (requires user_id - listen to authenticated user's messages in broadcaster's channel)  
+      // Chat messages (all users — server token is the broadcaster's)
       {
         type: 'channel.chat.message',
         version: '1',
         condition: {
           broadcaster_user_id: broadcasterId,
-          user_id: authenticatedUser?.id || broadcasterId
+          user_id: broadcasterId
         }
       }
     ];
@@ -402,14 +359,11 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
     for (const sub of subscriptions) {
       const subscription: EventSubSubscription = {
         ...sub,
-        transport: {
-          method: 'websocket',
-          session_id: sessionId
-        }
+        session_id: sessionId
       };
 
-      console.log(`Creating EventSub subscription: ${sub.type}`, subscription);
-      const success = await createEventSubSubscription(accessToken, subscription);
+      console.log(`Creating EventSub subscription: ${sub.type}`);
+      const success = await createEventSubSubscription(subscription);
       if (success) {
         console.log(`✅ Successfully created EventSub subscription: ${sub.type}`);
       } else {
@@ -447,20 +401,12 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
     isReconnectingRef.current = false;
   }, []);
 
-  const clearAuth = useCallback(() => {
-    disconnect();
-    clearTwitchToken();
-    clearTwitchSession();
-    setIsAuthenticated(false);
-    setMessages([]);
-  }, [disconnect]);
-
-  // Auto-connect on mount if authenticated
+  // Auto-connect on mount (no per-visitor login required — the token is
+  // server-side). Guard against double-invoke in React StrictMode.
   useEffect(() => {
-    const token = parseTwitchToken();
-    if (token) {
-      connect();
-    }
+    if (autoConnectTriedRef.current) return;
+    autoConnectTriedRef.current = true;
+    connect();
 
     return () => {
       // Cleanup on unmount
@@ -474,10 +420,8 @@ export function useTwitchEventSub(): UseTwitchEventSubReturn {
   return {
     messages,
     isConnected,
-    isAuthenticated,
     error,
     connect,
-    disconnect,
-    clearAuth
+    disconnect
   };
 }

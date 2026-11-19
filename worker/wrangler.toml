@@ -1,0 +1,24 @@
+name = "peachyhodl-twitch"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+# Route: intercept /twitch/* on the apex domain (zone must be on Cloudflare,
+# which it already is — peachyhodl.com is proxied). The site itself stays on
+# GitHub Pages; only /twitch/* is served by this worker.
+routes = [
+  { pattern = "peachyhodl.com/twitch/*", zone_name = "peachyhodl.com" }
+]
+
+# Secrets are managed from GitHub Secrets + the twitch-secrets workflow
+# (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_REFRESH_TOKEN,
+#  TWITCH_ACCESS_TOKEN, TWITCH_SETUP_KEY). Never commit them here.
+#
+# KV persists the short-lived access token between refreshes:
+#   npx wrangler kv namespace create TWITCH_KV
+# then put the returned id below and uncomment.
+# [[kv_namespaces]]
+# binding = "TWITCH_KV"
+# id = "<kv-namespace-id>"
+
+[observability]
+enabled = true

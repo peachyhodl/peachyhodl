@@ -3,15 +3,14 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Loader2, Tv, Zap, LogOut, LogIn, Gift, Heart, Users, Sparkles, Crown, UserPlus } from "lucide-react";
+import { Loader2, Tv, Zap, Gift, Heart, Users, Sparkles, Crown, UserPlus } from "lucide-react";
 import { useNostr } from "@nostrify/react";
 import { useAuthor } from "@/hooks/useAuthor";
 import { genUserName } from "@/lib/genUserName";
 import { useTwitchEventSub } from "@/hooks/useTwitchEventSub";
 import { useZapNotifications } from "@/hooks/useZapNotifications";
 import { useAuthor as useZapAuthor } from "@/hooks/useAuthor";
-import { getTwitchAuthUrl, TWITCH_CHANNEL } from "@/lib/twitch";
+import { TWITCH_CHANNEL } from "@/lib/twitch";
 import { NoteContent } from "@/components/NoteContent";
 import { ReactionButton } from "@/components/reactions/ReactionButton";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
@@ -449,10 +448,12 @@ function useLivestreamData() {
         const now = Math.floor(Date.now() / 1000);
         const oneDayAgo = now - (24 * 60 * 60);
 
-        // Get Peachy's own live events
+        // Get live events where Peachy is a participant. Streamsuite publishes
+        // these with its platform account (author != host per NIP-53 — the host
+        // is only tagged via `p`), so filtering by `authors` finds nothing.
         const peachyEvents = await nostr.query([{
           kinds: [30311],
-          authors: [PEACHY_HEX],
+          "#p": [PEACHY_HEX],
           since: oneDayAgo,
         }], { signal: abortController.signal });
 
@@ -539,9 +540,7 @@ export function UnifiedLivestreamChat() {
   const { 
     messages: twitchMessages, 
     isConnected: isTwitchConnected,
-    isAuthenticated: isTwitchAuthenticated,
-    error: twitchError,
-    clearAuth: clearTwitchAuth
+    error: twitchError
   } = useTwitchEventSub();
   
   const liveEvent = nostrData?.liveEvent;
@@ -704,10 +703,6 @@ export function UnifiedLivestreamChat() {
     }
   }, [newMessageIds]);
 
-  const handleTwitchAuth = () => {
-    window.location.href = getTwitchAuthUrl();
-  };
-
   const handlePeachClick = () => {
     if (!user) {
       setIsLoginDialogOpen(true);
@@ -742,32 +737,13 @@ export function UnifiedLivestreamChat() {
               )}
             </div>
             
-            {/* Twitch Connection Status */}
+            {/* Twitch Connection Status — no visitor login needed; the
+                broadcaster token lives server-side (worker/ + GitHub Secrets) */}
             <div className="flex items-center gap-2">
-              {isTwitchAuthenticated ? (
-                <>
-                  <Badge variant={isTwitchConnected ? "default" : "secondary"}>
-                    <Tv className="h-3 w-3 mr-1" />
-                    {isTwitchConnected ? 'EventSub Connected' : 'EventSub Connecting...'}
-                  </Badge>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={clearTwitchAuth}
-                  >
-                    <LogOut className="h-4 w-4" />
-                  </Button>
-                </>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={handleTwitchAuth}
-                >
-                  <LogIn className="h-4 w-4 mr-2" />
-                  Connect Twitch Events
-                </Button>
-              )}
+              <Badge variant={isTwitchConnected ? "default" : "secondary"}>
+                <Tv className="h-3 w-3 mr-1" />
+                {isTwitchConnected ? 'Twitch relay connected' : 'Twitch relay connecting...'}
+              </Badge>
             </div>
           </div>
         </div>
@@ -798,16 +774,6 @@ export function UnifiedLivestreamChat() {
                     <p className="text-sm opacity-70">
                       Waiting for the stream to begin...
                     </p>
-                    {!isTwitchAuthenticated && (
-                      <Button
-                        className="mt-4"
-                        variant="secondary"
-                        onClick={handleTwitchAuth}
-                      >
-                        <Tv className="h-4 w-4 mr-2" />
-                        Connect Twitch to see follows, bits, and subs
-                      </Button>
-                    )}
                   </div>
                 ) : (
                   <div className="space-y-3 w-full overflow-hidden">
