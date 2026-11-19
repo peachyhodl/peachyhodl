@@ -10,15 +10,22 @@ routes = [
 ]
 
 # Secrets are managed from GitHub Secrets + the twitch-secrets workflow
-# (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_REFRESH_TOKEN,
-#  TWITCH_ACCESS_TOKEN, TWITCH_SETUP_KEY). Never commit them here.
+# (TWITCH_CLIENT_ID, TWITCH_REFRESH_TOKEN, TWITCH_ACCESS_TOKEN,
+#  TWITCH_SETUP_KEY; TWITCH_CLIENT_SECRET optional — Peachy's app is a
+# Public client type, so the flow uses PKCE and no secret). Never commit them.
 #
-# KV persists the short-lived access token between refreshes:
-#   npx wrangler kv namespace create TWITCH_KV
-# then put the returned id below and uncomment.
-# [[kv_namespaces]]
-# binding = "TWITCH_KV"
-# id = "<kv-namespace-id>"
+# KV is REQUIRED for refresh mode: it persists rotated refresh tokens
+# (Public-client refresh tokens expire after 30 days unless rotated) and the
+# short-lived access token. The deploy workflow provisions the namespace via
+# the Cloudflare API and fills the id in at deploy time.
+[[kv_namespaces]]
+binding = "TWITCH_KV"
+id = "<kv-namespace-id>"
+
+[triggers]
+# Refresh-token keep-alive for Public client types: each refresh issues a
+# fresh 30-day refresh token, so running every few days keeps the auth alive.
+crons = ["0 9 */5 * *"]
 
 [observability]
 enabled = true

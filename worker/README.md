@@ -21,9 +21,9 @@ already-proxied zone; the site itself stays on GitHub Pages).
 | Secret | Mode | Notes |
 |---|---|---|
 | `TWITCH_CLIENT_ID` | both | Twitch application client id |
-| `TWITCH_CLIENT_SECRET` | both | required for refresh mode + setup flow |
-| `TWITCH_REFRESH_TOKEN` | refresh (preferred) | long-lived; the worker auto-refreshes the access token |
-| `TWITCH_ACCESS_TOKEN` | manual (fallback) | pasted user token; expires ~60d, admin re-pastes |
+| `TWITCH_CLIENT_SECRET` | optional | **not needed for Peachy's app** (Public client type — PKCE used instead). Only relevant if the app is ever switched to Confidential. |
+| `TWITCH_REFRESH_TOKEN` | refresh (preferred) | long-lived; the worker auto-refreshes the access token. **Public client caveat:** refresh tokens expire after 30 days unless rotated — the worker's cron refreshes every 5 days, which re-issues a fresh refresh token, so the auth stays alive. Requires the `TWITCH_KV` binding. |
+| `TWITCH_ACCESS_TOKEN` | manual (fallback) | pasted user token; expires (~4h for user tokens), admin re-pastes |
 | `TWITCH_SETUP_KEY` | both | random string gating the OAuth setup flow |
 
 All of them are stored as **GitHub repo secrets** and pushed to the worker by
@@ -32,20 +32,23 @@ value = edit the repo secret → run the workflow.
 
 ## Admin setup (first time)
 
-1. Repo secrets: `CLOUDFLARE_API_TOKEN` (Workers Scripts:Edit for the
-   peachyhodl.com zone), `CLOUDFLARE_ACCOUNT_ID`, `TWITCH_CLIENT_ID`,
-   `TWITCH_CLIENT_SECRET`, `TWITCH_SETUP_KEY`.
-2. Run **Twitch Secrets → Worker** once (deploys worker + secrets).
-3. Create the KV namespace and uncomment it in `wrangler.toml` (recommended —
-   caches the access token between refreshes):
-   `npx wrangler kv namespace create TWITCH_KV`
-4. As Peachy (logged into Twitch), open
+1. Repo secrets: `CLOUDFLARE_API_TOKEN` (Workers Scripts:Edit, Workers
+   Routes:Edit, Workers KV Storage:Edit for the peachyhodl.com zone),
+   `CLOUDFLARE_ACCOUNT_ID`, `TWITCH_CLIENT_ID`, `TWITCH_SETUP_KEY`.
+   `TWITCH_CLIENT_SECRET` not needed — the app is a **Public** client type,
+   so the worker uses PKCE.
+   In the Twitch dev console, also add the redirect URI
+   `https://peachyhodl.com/twitch/oauth/callback` to the app.
+2. Run **Twitch Secrets → Worker** once (deploys worker + secrets + KV).
+3. As Peachy (logged into Twitch), open
    `https://peachyhodl.com/twitch/oauth/setup?key=<TWITCH_SETUP_KEY>`,
    approve, and copy the refresh token the callback shows.
-5. Paste it into repo secret `TWITCH_REFRESH_TOKEN` → run the workflow again.
+4. Paste it into repo secret `TWITCH_REFRESH_TOKEN` → run the workflow again.
 
-After step 5 the token refreshes itself; nobody touches it again unless the
-refresh token is revoked.
+After step 4: the worker refreshes the access token automatically, and the
+every-5-days cron rotates the refresh token — Public clients' 30-day refresh
+expiry never bites. Nobody touches it again unless the refresh grant is
+revoked (password change / app disconnect → Peachy re-does steps 3–4).
 
 ## Scopes requested
 

@@ -7,7 +7,8 @@
  *
  * Env/secrets (set via `wrangler secret put` — managed from GitHub Secrets):
  *   TWITCH_CLIENT_ID      required — the Twitch application client id
- *   TWITCH_CLIENT_SECRET  required for refresh-token mode and the setup flow
+ *   TWITCH_CLIENT_SECRET  optional — only needed for Confidential client
+ *                         types; Peachy's app is Public (PKCE), no secret
  *   TWITCH_REFRESH_TOKEN  preferred — long-lived refresh token (offline_access),
  *                         auto-refreshes the access token; no manual upkeep
  *   TWITCH_ACCESS_TOKEN   fallback — manual user access token (expires ~60d);
@@ -57,15 +58,34 @@ function json(data: unknown, status = 200, origin?: string | null): Response {
 
 /** Exchange the refresh token for a fresh access token. */
 async function refreshAccessToken(env: Env): Promise<{ access: string; refresh?: string; expiresIn: number }> {
-  if (!env.TWITCH_REFRESH_TOKEN || !env.TWITCH_CLIENT_SECRET) {
+  // Twitch rotates refresh tokens on refresh ("refresh tokens may change —
+  // store the new one"). The newest one lives in KV; the GitHub secret holds
+  // the original bootstrap value. Prefer KV, fall back to the secret.
+  let refreshToken = env.TWITCH_REFRESH_TOKEN ?? null;
+  if (env.TWITCH_KV) {
+    try {
+      const raw = await env.TWITCH_KV.get('token');
+      if (raw) {
+        const t = JSON.parse(raw) as CachedToken;
+        if (t.refresh_token) refreshToken = t.refresh_token;
+      }
+    } catch { /* fall back to env */ }
+  }
+  if (!refreshToken) {
     throw new Error('refresh-mode-not-configured');
   }
   const body = new URLSearchParams({
     client_id: env.TWITCH_CLIENT_ID,
-    client_secret: env.TWITCH_CLIENT_SECRET,
     grant_type: 'refresh_token',
-    refresh_token: env.TWITCH_REFRESH_TOKEN,
+    // URLSearchParams form-encodes; the docs warn refresh tokens may contain
+    // restricted characters and must be URL encoded.
+    refresh_token: refreshToken,
   });
+  // Confidential clients send their secret; Public clients (Peachy's app)
+  // must NOT — PKCE-issued grants refresh with client_id alone.
+  if (env.TWITCH_CLIENT_SECRET) {
+    body.set('client_secret', env.TWITCH_CLIENT_SECRET);
+  }
   const res = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', body });
   const data = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
   if (!res.ok || !data.access_token) {
@@ -237,30 +257,69 @@ export default {
       if (!env.TWITCH_SETUP_KEY || url.searchParams.get('key') !== env.TWITCH_SETUP_KEY) {
         return json({ error: 'forbidden' }, 403, origin(req));
       }
+      // PKCE — required for Public client types (no client secret), harmless
+      // for Confidential. The verifier is stored server-side (KV) and never
+      // touches the URL.
+      const random = new Uint8Array(64);
+      crypto.getRandomValues(random);
+      const b64url = (buf: ArrayBuffer | Uint8Array) =>
+        btoa(String.fromCharCode(...new Uint8Array(buf as Uint8Array)))
+          .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const verifier = b64url(random);
+      const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+
+      const state = crypto.randomUUID();
+      if (!env.TWITCH_KV) {
+        if (env.TWITCH_CLIENT_SECRET) {
+          // Confidential mode: classic exchange works without KV.
+        } else {
+          return json({ error: 'kv-required', hint: 'admin: public client type needs the TWITCH_KV binding (see worker/README.md)' }, 503, origin(req));
+        }
+      } else {
+        await env.TWITCH_KV.put(`pkce:${state}`, verifier, { expirationTtl: 600 });
+      }
+
       const scopes = 'user:read:chat chat:read moderator:read:followers bits:read channel:read:subscriptions offline_access';
       const params = new URLSearchParams({
         client_id: env.TWITCH_CLIENT_ID,
         redirect_uri: `${url.origin}/twitch/oauth/callback`,
         response_type: 'code',
         scope: scopes,
-        state: url.searchParams.get('key') ?? '',
+        state,
       });
+      if (env.TWITCH_KV) {
+        params.set('code_challenge', challenge);
+        params.set('code_challenge_method', 'S256');
+      }
       return Response.redirect(`https://id.twitch.tv/oauth2/authorize?${params}`, 302);
     }
 
     if (route === '/twitch/oauth/callback' && req.method === 'GET') {
-      const key = url.searchParams.get('state') ?? url.searchParams.get('key') ?? '';
+      const state = url.searchParams.get('state') ?? '';
       const code = url.searchParams.get('code');
-      if (!env.TWITCH_SETUP_KEY || key !== env.TWITCH_SETUP_KEY || !code || !env.TWITCH_CLIENT_SECRET) {
+      if (!env.TWITCH_SETUP_KEY || !state || !code) {
+        return json({ error: 'forbidden-or-incomplete' }, 403, origin(req));
+      }
+      // PKCE verifier proves the callback belongs to a setup flow we started.
+      let verifier: string | null = null;
+      if (env.TWITCH_KV) {
+        verifier = await env.TWITCH_KV.get(`pkce:${state}`);
+        if (verifier) await env.TWITCH_KV.delete(`pkce:${state}`);
+      }
+      if (!verifier && !env.TWITCH_CLIENT_SECRET) {
         return json({ error: 'forbidden-or-incomplete' }, 403, origin(req));
       }
       const body = new URLSearchParams({
         client_id: env.TWITCH_CLIENT_ID,
-        client_secret: env.TWITCH_CLIENT_SECRET,
         code,
         grant_type: 'authorization_code',
         redirect_uri: `${url.origin}/twitch/oauth/callback`,
       });
+      if (env.TWITCH_CLIENT_SECRET) {
+        body.set('client_secret', env.TWITCH_CLIENT_SECRET);
+      } else if (verifier) {
+        body.set('code_verifier', verifier);
+      }
       const res = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', body });
       const data = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
       if (!res.ok || !data.refresh_token) {
@@ -276,5 +335,21 @@ export default {
     }
 
     return json({ error: 'unknown-route' }, 404, origin(req));
+  },
+
+  // Public client types: refresh tokens expire after 30 days unless they are
+  // rotated before then. Refreshing issues a fresh 30-day refresh token, so a
+  // periodic refresh keeps the authorization alive indefinitely.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Refresh mode only (bootstrap refresh token required; rotated tokens are
+    // persisted in KV by the refresh path above).
+    if (!env.TWITCH_REFRESH_TOKEN) return;
+    if (!env.TWITCH_KV) {
+      console.error('keepalive skipped: TWITCH_KV binding missing — public-client refresh tokens would not be persisted');
+      return;
+    }
+    ctx.waitUntil(
+      getToken(env, true).catch((e) => console.error('keepalive refresh failed:', (e as Error).message)),
+    );
   },
 };
