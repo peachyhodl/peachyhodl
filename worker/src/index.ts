@@ -136,8 +136,10 @@ async function getToken(env: Env, forceRefresh = false): Promise<string> {
   }
 }
 
-/** Authenticated Helix GET/POST with one automatic refresh+retry on 401. */
-async function helix(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
+/** Authenticated Helix GET/POST with one automatic refresh+retry on 401.
+ *  Token failures (none configured / refresh grant dead) become a clean 503
+ *  instead of an uncaught exception (CF error 1101 → browser sees a bare 500). */
+async function helix(env: Env, path: string, init: RequestInit = {}, origin: string | null = null): Promise<Response> {
   const doFetch = async (token: string) =>
     fetch(`${HELIX}${path}`, {
       ...init,
@@ -147,9 +149,17 @@ async function helix(env: Env, path: string, init: RequestInit = {}): Promise<Re
         ...(init.headers ?? {}),
       },
     });
-  let res = await doFetch(await getToken(env));
-  if (res.status === 401 && (env.TWITCH_REFRESH_TOKEN || env.TWITCH_KV)) {
-    res = await doFetch(await getToken(env, true));
+  let res: Response;
+  try {
+    res = await doFetch(await getToken(env));
+    if (res.status === 401 && (env.TWITCH_REFRESH_TOKEN || env.TWITCH_KV)) {
+      res = await doFetch(await getToken(env, true));
+    }
+  } catch {
+    return json({
+      error: 'no-token',
+      hint: 'admin: complete the one-time OAuth setup (worker/README.md) or set TWITCH_ACCESS_TOKEN, then re-run the "Twitch Secrets → Worker" workflow',
+    }, 503, origin);
   }
   return res;
 }
@@ -203,7 +213,7 @@ export default {
         }
         return json({ valid: true, login: data.login, expires_in: data.expires_in, scopes: data.scopes }, 200, origin(req));
       } catch (e) {
-        return json({ valid: false, error: (e as Error).message, hint: 'admin: check TWITCH_REFRESH_TOKEN / TWITCH_CLIENT_SECRET secrets' }, 200, origin(req));
+        return json({ valid: false, error: (e as Error).message, hint: 'admin: no Twitch token yet — complete the one-time OAuth setup (worker/README.md) to obtain TWITCH_REFRESH_TOKEN, then re-run the workflow' }, 200, origin(req));
       }
     }
 
@@ -213,7 +223,7 @@ export default {
       if (!/^[a-zA-Z0-9_]{3,25}$/.test(login)) {
         return json({ error: 'bad-login' }, 400, origin(req));
       }
-      const res = await helix(env, `/users?login=${login}`);
+      const res = await helix(env, `/users?login=${login}`, {}, origin(req));
       if (!res.ok) {
         return json({ error: 'helix-error', status: res.status }, res.status, origin(req));
       }
@@ -244,7 +254,7 @@ export default {
           condition,
           transport: { method: 'websocket', session_id },
         }),
-      });
+      }, origin(req));
       const data = await res.json() as Record<string, unknown>;
       if (!res.ok) {
         return json({ error: 'subscription-failed', status: res.status, detail: data }, res.status, origin(req));
